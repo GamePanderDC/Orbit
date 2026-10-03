@@ -73,8 +73,8 @@ func (b *TURNBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		}
 		return count, nil
 	}
-	// Return 2 ReceiveFunc workers so wireguard-go can parallelize packet decryption routines
-	return []conn.ReceiveFunc{recvFunc, recvFunc}, port, nil
+	// Return single ReceiveFunc worker to guarantee strict in-order packet delivery to WireGuard
+	return []conn.ReceiveFunc{recvFunc}, port, nil
 }
 
 // Close stops receiving packets.
