@@ -26,9 +26,9 @@ mkdir -p dist/Payload
 cp -R dist/Orbit.xcarchive/Products/Applications/VKTurnProxy.app dist/Payload/
 
 # Remove widget extension for Feather/AltStore compatibility (see docs/sideload.md)
-if [ -d "dist/Payload/VKTurnProxy.app/PlugIns/OrbitWidgetExtension.appex" ]; then
-  echo "Removing OrbitWidgetExtension for Feather compatibility..."
-  rm -rf "dist/Payload/VKTurnProxy.app/PlugIns/OrbitWidgetExtension.appex"
+if [ -d "dist/Payload/VKTurnProxy.app/PlugIns" ]; then
+  echo "Stripping non-PacketTunnel plugins for Feather compatibility..."
+  find dist/Payload/VKTurnProxy.app/PlugIns -mindepth 1 -maxdepth 1 ! -name 'PacketTunnel.appex' -exec rm -rf {} +
 fi
 
 cd dist

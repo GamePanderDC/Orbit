@@ -35,6 +35,7 @@ goroot: $(BUILDDIR)
 		rm -rf "$(PATCHED_GOROOT)"; \
 		mkdir -p "$(PATCHED_GOROOT)"; \
 		rsync -a --delete --exclude=pkg/obj/go-build "$(REAL_GOROOT)/" "$(PATCHED_GOROOT)/"; \
+		chmod -R u+w "$(PATCHED_GOROOT)"; \
 		cd "$(PATCHED_GOROOT)" && (patch -p1 -f -N -r- < "$(CURDIR)/goruntime-boottime-over-monotonic.diff" || true); \
 		touch "$(PATCHED_GOROOT)/.patched"; \
 		echo "==> GOROOT patched successfully"; \

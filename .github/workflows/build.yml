@@ -23,8 +23,18 @@ jobs:
 
       - name: Select Xcode version
         run: |
-          sudo xcode-select -s /Applications/Xcode_16.2.app || sudo xcode-select -s /Applications/Xcode_16.1.app || sudo xcode-select -s /Applications/Xcode_16.0.app || sudo xcode-select -s /Applications/Xcode_16.app || true
+          echo "=== Available Xcode versions ==="
+          ls -ld /Applications/Xcode*
+          # Use default Xcode.app or latest 16.x that matches preinstalled simulator runtimes
+          if [ -d "/Applications/Xcode.app" ]; then
+            sudo xcode-select -s /Applications/Xcode.app
+          elif [ -d "/Applications/Xcode_16.4.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.4.app
+          elif [ -d "/Applications/Xcode_16.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.app
+          fi
           xcodebuild -version
+          xcrun simctl runtime list || true
 
       - name: Build WireGuardTURN.xcframework
         run: |
@@ -47,10 +57,10 @@ jobs:
           mkdir -p build/Payload
           cp -r build/Orbit.xcarchive/Products/Applications/VKTurnProxy.app build/Payload/
           
-          # Remove widget extension if present for Feather/AltStore compatibility (see docs/sideload.md)
-          if [ -d "build/Payload/VKTurnProxy.app/PlugIns/OrbitWidgetExtension.appex" ]; then
-            echo "Removing OrbitWidgetExtension for Feather compatibility..."
-            rm -rf "build/Payload/VKTurnProxy.app/PlugIns/OrbitWidgetExtension.appex"
+          # Keep only PacketTunnel.appex for Feather/AltStore compatibility (see docs/sideload.md)
+          if [ -d "build/Payload/VKTurnProxy.app/PlugIns" ]; then
+            echo "Stripping non-PacketTunnel plugins for Feather compatibility..."
+            find build/Payload/VKTurnProxy.app/PlugIns -mindepth 1 -maxdepth 1 ! -name 'PacketTunnel.appex' -exec rm -rf {} +
           fi
           
           cd build
