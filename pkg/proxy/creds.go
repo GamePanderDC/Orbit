@@ -2589,6 +2589,16 @@ func (cp *credPool) slotAvailableChannel() <-chan struct{} {
 	return cp.slotAvailableCh
 }
 
+// hasCredsForSlot reports whether pool[slot] has usable fresh credentials.
+func (cp *credPool) hasCredsForSlot(slot int) bool {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	if slot < 0 || slot >= len(cp.pool) {
+		return false
+	}
+	return entryIsFresh(cp.pool[slot])
+}
+
 // snapshotSize returns (freshCount, withCredsCount, totalCapacity) of
 // the pool — used by the stats endpoint so the UI can display
 // "fresh / with-creds / total". Takes the lock briefly; safe to call

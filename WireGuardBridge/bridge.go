@@ -303,8 +303,8 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 		return -5
 	}
 
-	// Create WireGuard device with our custom bind
-	logger := device.NewLogger(device.LogLevelVerbose, "(wireguard-turn) ")
+	// Create WireGuard device with our custom bind (LogLevelError for performance)
+	logger := device.NewLogger(device.LogLevelError, "(wireguard-turn) ")
 	dev := device.NewDevice(tunDev, bind, logger)
 
 	// Apply UAPI configuration
@@ -562,7 +562,7 @@ func wgAttachWireGuard(tunnelHandle C.int32_t, wgConfigSettings *C.char, tunFd C
 		return -4
 	}
 
-	logger := device.NewLogger(device.LogLevelVerbose, "(wireguard-turn) ")
+	logger := device.NewLogger(device.LogLevelError, "(wireguard-turn) ")
 	dev := device.NewDevice(tunDev, bind, logger)
 
 	if err := dev.IpcSet(goSettings); err != nil {

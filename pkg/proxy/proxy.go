@@ -473,8 +473,8 @@ func NewProxy(cfg Config) *Proxy {
 		config:          cfg,
 		ctx:             ctx,
 		cancel:          cancel,
-		sendCh:          make(chan []byte, 256),
-		recvCh:          make(chan []byte, 256),
+		sendCh:          make(chan []byte, 2048),
+		recvCh:          make(chan []byte, 2048),
 		sessCtx:         sessCtx,
 		sessCancel:      sessCancel,
 		captchaCh:       make(chan string, 1),
@@ -1058,30 +1058,44 @@ func (p *Proxy) startConnections() error {
 	// For NumConns ≤ burstSize, the slow branch is never taken and
 	// behaviour matches the previous linear stagger (200ms × i).
 	const burstSize = 10
-	// 100ms burst stagger: first ~10 conns come up ~1s faster than the old
-	// 200ms cadence. VK's allocation token bucket still tolerates this
-	// (empirical 10-alloc burst); if 486 quota appears, grower/retry handle it.
 	const burstStagger = 100 * time.Millisecond
-	const slowStagger = 5 * time.Second
 	for i := 1; i < p.config.NumConns; i++ {
 		p.wg.Add(1)
 		connIdx := i
 		go func() {
 			defer p.wg.Done()
-			var delay time.Duration
-			if connIdx < burstSize {
-				delay = time.Duration(connIdx) * burstStagger
+			slot := connIdx / connsPerSlot
+			subIdx := connIdx % connsPerSlot
+			slotDelay := time.Duration(subIdx) * burstStagger
+
+			if slot == 0 {
+				// Slot 0 (conns 0-9) starts immediately in burst
+				select {
+				case <-time.After(slotDelay):
+				case <-sessCtx.Done():
+					return
+				}
 			} else {
-				// Burst phase ends at (burstSize-1)*burstStagger after t=0.
-				// Then each subsequent conn launches slowStagger after
-				// the previous one.
-				delay = time.Duration(burstSize-1)*burstStagger +
-					time.Duration(connIdx-burstSize+1)*slowStagger
-			}
-			select {
-			case <-time.After(delay):
-			case <-sessCtx.Done():
-				return
+				// Slots 1+ (conns 10+): wait until credentials for this slot
+				// are available (from cache, pre-bootstrap, or background grower),
+				// or until fallback timeout (3s per slot), then stagger.
+				maxWait := time.Duration(slot) * 3 * time.Second
+				waitStart := time.Now()
+				for !p.credPool.hasCredsForSlot(slot) && time.Since(waitStart) < maxWait {
+					slotCh := p.credPool.slotAvailableChannel()
+					select {
+					case <-slotCh:
+					case <-time.After(500 * time.Millisecond):
+					case <-sessCtx.Done():
+						return
+					}
+				}
+				// Small per-conn stagger so they don't hit Allocate at the exact same microsecond
+				select {
+				case <-time.After(slotDelay):
+				case <-sessCtx.Done():
+					return
+				}
 			}
 			p.runConnection(sessCtx, p.linkID, nil, connIdx)
 		}()
@@ -1578,9 +1592,33 @@ func (p *Proxy) runWatchdog() {
 	}
 }
 
-// SendPacket sends a WireGuard packet through the tunnel.
+// sendPktPool recycles []byte slices used to hand off packets from
+// WireGuard's SendPacket into sendCh. Eliminates per-packet heap allocations
+// on the transmit path.
+var sendPktPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 2048)
+	},
+}
+
+func sendPktPoolGet(n int) []byte {
+	b := sendPktPool.Get().([]byte)
+	if cap(b) < n {
+		b = make([]byte, n)
+	}
+	return b[:n]
+}
+
+func sendPktPoolPut(b []byte) {
+	if b == nil {
+		return
+	}
+	sendPktPool.Put(b[:cap(b)])
+}
+
+// SendPacket sends a WireGuard packet through the tunnel using the buffer pool.
 func (p *Proxy) SendPacket(data []byte) error {
-	buf := make([]byte, len(data))
+	buf := sendPktPoolGet(len(data))
 	copy(buf, data)
 	select {
 	case p.sendCh <- buf:
@@ -1588,6 +1626,7 @@ func (p *Proxy) SendPacket(data []byte) error {
 		p.txPackets.Add(1)
 		return nil
 	case <-p.ctx.Done():
+		sendPktPoolPut(buf)
 		return p.ctx.Err()
 	}
 }
@@ -1608,6 +1647,21 @@ func (p *Proxy) ReceivePacket(buf []byte) (int, error) {
 		return n, nil
 	case <-p.ctx.Done():
 		return 0, p.ctx.Err()
+	}
+}
+
+// TryReceivePacket attempts to receive a packet from the tunnel without blocking.
+// Used for batching in TURNBind to drain queued packets in high-throughput bursts.
+func (p *Proxy) TryReceivePacket(buf []byte) (int, bool) {
+	select {
+	case pkt := <-p.recvCh:
+		n := copy(buf, pkt)
+		recvPktPoolPut(pkt)
+		p.rxBytes.Add(int64(n))
+		p.rxPackets.Add(1)
+		return n, true
+	default:
+		return 0, false
 	}
 }
 
@@ -2696,16 +2750,36 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	go func() {
 		defer wg.Done()
 		defer connCancel()
+		var lastDeadlineSet time.Time
 		for {
 			select {
 			case <-connCtx.Done():
 				log.Printf("proxy: [conn %d] DTLS send goroutine: ctx cancelled", connIdx)
 				return
 			case pkt := <-p.sendCh:
-				dtlsConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-				if _, err := dtlsConn.Write(pkt); err != nil {
+				if time.Since(lastDeadlineSet) > 5*time.Second {
+					dtlsConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+					lastDeadlineSet = time.Now()
+				}
+				_, err := dtlsConn.Write(pkt)
+				sendPktPoolPut(pkt)
+				if err != nil {
 					log.Printf("proxy: [conn %d] DTLS send goroutine: write error: %v", connIdx, err)
 					return
+				}
+				// Drain up to 3 more queued packets to keep packet trains contiguous and reduce reordering
+				for b := 0; b < 3; b++ {
+					select {
+					case nextPkt := <-p.sendCh:
+						_, err := dtlsConn.Write(nextPkt)
+						sendPktPoolPut(nextPkt)
+						if err != nil {
+							log.Printf("proxy: [conn %d] DTLS send goroutine: write error: %v", connIdx, err)
+							return
+						}
+					default:
+						break
+					}
 				}
 			}
 		}
@@ -2947,14 +3021,32 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	go func() {
 		defer wg.Done()
 		defer connCancel()
+		var lastDeadlineSet time.Time
 		for {
 			select {
 			case <-connCtx.Done():
 				return
 			case pkt := <-p.sendCh:
-				conn1.SetWriteDeadline(time.Now().Add(30 * time.Second))
-				if _, err := conn1.WriteTo(pkt, p.peer); err != nil {
+				if time.Since(lastDeadlineSet) > 5*time.Second {
+					conn1.SetWriteDeadline(time.Now().Add(30 * time.Second))
+					lastDeadlineSet = time.Now()
+				}
+				_, err := conn1.WriteTo(pkt, p.peer)
+				sendPktPoolPut(pkt)
+				if err != nil {
 					return
+				}
+				for b := 0; b < 3; b++ {
+					select {
+					case nextPkt := <-p.sendCh:
+						_, err := conn1.WriteTo(nextPkt, p.peer)
+						sendPktPoolPut(nextPkt)
+						if err != nil {
+							return
+						}
+					default:
+						break
+					}
 				}
 			}
 		}
@@ -3135,15 +3227,34 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	go func() {
 		defer wg.Done()
 		defer connCancel()
+		var lastDeadlineSet time.Time
 		for {
 			select {
 			case <-connCtx.Done():
 				return
 			case pkt := <-p.sendCh:
-				dtlsConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-				if _, werr := dtlsConn.Write(pkt); werr != nil {
+				if time.Since(lastDeadlineSet) > 5*time.Second {
+					dtlsConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+					lastDeadlineSet = time.Now()
+				}
+				_, werr := dtlsConn.Write(pkt)
+				sendPktPoolPut(pkt)
+				if werr != nil {
 					log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, werr)
 					return
+				}
+				for b := 0; b < 3; b++ {
+					select {
+					case nextPkt := <-p.sendCh:
+						_, werr := dtlsConn.Write(nextPkt)
+						sendPktPoolPut(nextPkt)
+						if werr != nil {
+							log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, werr)
+							return
+						}
+					default:
+						break
+					}
 				}
 			}
 		}
@@ -4777,30 +4888,43 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 	go func() {
 		defer wg.Done()
 		defer connCancel()
+		var lastDeadlineSet time.Time
 		for {
 			select {
 			case <-connCtx.Done():
 				log.Printf("proxy: [conn %d] SRTP send goroutine: ctx cancelled", connIdx)
 				return
 			case pkt := <-p.sendCh:
-				_ = srtpConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-				if _, err := srtpConn.Write(pkt); err != nil {
+				if time.Since(lastDeadlineSet) > 5*time.Second {
+					_ = srtpConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+					lastDeadlineSet = time.Now()
+				}
+				_, err := srtpConn.Write(pkt)
+				if connIdx >= 0 && connIdx < len(p.connTxBytes) {
+					p.connTxBytes[connIdx].Add(int64(len(pkt)))
+					p.lastTxAt[connIdx].Store(time.Now().UnixNano())
+				}
+				sendPktPoolPut(pkt)
+				if err != nil {
 					log.Printf("proxy: [conn %d] SRTP send error: %v", connIdx, err)
 					return
 				}
-				// Per-conn TX byte counter, parity with the DTLS path
-				// at proxy.go:2818. Counts the pre-SRTP payload bytes
-				// (WireGuard records that came out of sendCh), not the
-				// wire bytes after RTP+SRTP framing — matches what an
-				// external observer counting WG throughput would see,
-				// and matches the DTLS path's accounting so the conn-
-				// stats tick output reads the same regardless of
-				// transport mode.
-				if connIdx >= 0 && connIdx < len(p.connTxBytes) {
-					p.connTxBytes[connIdx].Add(int64(len(pkt)))
-					// lastTxAt mirror — see DTLS path comment in runTURN
-					// for skip-on-recent-tx rationale.
-					p.lastTxAt[connIdx].Store(time.Now().UnixNano())
+				for b := 0; b < 3; b++ {
+					select {
+					case nextPkt := <-p.sendCh:
+						_, err := srtpConn.Write(nextPkt)
+						if connIdx >= 0 && connIdx < len(p.connTxBytes) {
+							p.connTxBytes[connIdx].Add(int64(len(nextPkt)))
+							p.lastTxAt[connIdx].Store(time.Now().UnixNano())
+						}
+						sendPktPoolPut(nextPkt)
+						if err != nil {
+							log.Printf("proxy: [conn %d] SRTP send error: %v", connIdx, err)
+							return
+						}
+					default:
+						break
+					}
 				}
 			}
 		}

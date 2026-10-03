@@ -40,6 +40,7 @@ func (b *TURNBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		if len(packets) == 0 {
 			return 0, nil
 		}
+		// First packet: blocking read
 		n, err := b.proxy.ReceivePacket(packets[0])
 		if err != nil {
 			b.mu.Lock()
@@ -52,9 +53,28 @@ func (b *TURNBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		}
 		sizes[0] = n
 		eps[0] = &TURNEndpoint{}
-		return 1, nil
+		count := 1
+		maxBatch := len(packets)
+		if len(sizes) < maxBatch {
+			maxBatch = len(sizes)
+		}
+		if len(eps) < maxBatch {
+			maxBatch = len(eps)
+		}
+		// Opportunistically drain further available packets from the proxy channel
+		for count < maxBatch {
+			pn, ok := b.proxy.TryReceivePacket(packets[count])
+			if !ok {
+				break
+			}
+			sizes[count] = pn
+			eps[count] = &TURNEndpoint{}
+			count++
+		}
+		return count, nil
 	}
-	return []conn.ReceiveFunc{recvFunc}, port, nil
+	// Return 2 ReceiveFunc workers so wireguard-go can parallelize packet decryption routines
+	return []conn.ReceiveFunc{recvFunc, recvFunc}, port, nil
 }
 
 // Close stops receiving packets.
@@ -85,9 +105,9 @@ func (b *TURNBind) ParseEndpoint(s string) (conn.Endpoint, error) {
 	return &TURNEndpoint{addr: s}, nil
 }
 
-// BatchSize returns 1 (no batching through TURN).
+// BatchSize returns the batch size for packet processing (32 for high throughput).
 func (b *TURNBind) BatchSize() int {
-	return 1
+	return 32
 }
 
 // TURNEndpoint is a dummy endpoint since all traffic goes through
